@@ -1,0 +1,22 @@
+# Fantasy Football Intelligence Engine — dependency manifest
+#
+# Four dependencies, each with a single job. Pinned to a minor floor rather
+# than an exact version: ESPN changes its private API without notice, and the
+# espn-api wrapper is the layer that absorbs those changes, so it needs room
+# to move within a major version.
+
+# Drives a real Chrome binary for the one-time ESPN session-credential capture.
+# Only auth_bridge.py imports this; the rest of the engine is pure HTTP.
+playwright>=1.40,<2.0
+
+# Typed wrapper over ESPN's private v3 fantasy API. Supplies league settings,
+# rosters, and the free-agent pool.
+espn-api>=0.35,<1.0
+
+# Loads SWID / espn_s2 / LEAGUE_ID from the local .env. Credentials never live
+# in source, and .env is gitignored.
+python-dotenv>=1.0,<2.0
+
+# Direct transport for the live-draft hot path, where we need control over the
+# x-fantasy-filter header and cannot afford a full league re-fetch per poll.
+requests>=2.31,<3.0

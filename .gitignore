@@ -1,0 +1,21 @@
+# Credentials — never commit. ESPN_S2 is a live session token.
+.env
+.env.local
+
+# Playwright's dedicated Chrome profile. Contains the authenticated session.
+.chrome-profile/
+
+# Generated boards, plans, and caches. Reproducible from the scripts.
+data/
+*.csv
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# OS
+.DS_Store
