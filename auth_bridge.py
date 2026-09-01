@@ -1,183 +1,108 @@
 #!/usr/bin/env python3
-"""Secure authentication bridge: capture ESPN session credentials into .env.
+"""Command-line ESPN session capture.
+
+The desktop app's "Connect ESPN Account" button does the same job; this is the
+equivalent for developers working from source.
 
 ESPN's fantasy v3 API has no public OAuth flow and no API keys. Access to a
-*private* league is gated entirely on two browser cookies:
+private league is gated entirely on two browser cookies:
 
     SWID      the account's global identifier, a braced UUID
     espn_s2   a long-lived, URL-encoded session token
 
 The only supported way to obtain them is to be logged in to ESPN in a real
-browser. This script automates that honestly rather than pretending to:
+browser. This script automates that honestly rather than pretending to: it
+launches a genuine Chrome binary, opens ESPN's login page, and hands you the
+window. You log in by hand. Nothing types your password and nothing reads it.
 
-    1. Launches a genuine Chrome binary via Playwright (``channel="chrome"``)
-       against a *dedicated* profile directory under ``.chrome-profile/``.
-    2. Opens ESPN's fantasy homepage and hands you the window.
-    3. You log in once, by hand, in that window. Nothing types your password
-       for you and nothing reads your password.
-    4. Once the cookie jar contains both credentials, they are written to the
-       local ``.env`` — which is gitignored and never leaves this machine.
-
-Because the profile persists, subsequent runs usually find you already signed
-in and complete without interaction. Re-run this whenever the assistant starts
-returning 401s; ESPN rotates ``espn_s2`` on password change and roughly
-annually otherwise.
-
-A note on why this does NOT read your everyday Chrome profile: Chrome holds an
-exclusive lock on a running profile, and its cookie store is encrypted with an
-OS keychain entry. Prying that open would be both fragile and a bad security
-posture. A dedicated profile is the correct boundary.
+On not reading your everyday Chrome profile: Chrome holds an exclusive lock on
+a running profile, and its cookie store is encrypted against an OS keychain
+entry. Prying that open would be fragile and a poor security posture. A separate
+browser session is the correct boundary, and the cost is one manual login.
 
 Usage:
-    python auth_bridge.py                 # interactive capture
-    python auth_bridge.py --headless      # only works if profile is warm
-    python auth_bridge.py --print-only    # show cookies, do not write .env
+    python auth_bridge.py
 """
 
-from __future__ import annotations
-
-import argparse
 import sys
 import time
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-PROFILE_DIR = PROJECT_ROOT / ".chrome-profile"
-ENV_PATH = PROJECT_ROOT / ".env"
+from playwright.sync_api import sync_playwright
 
-ESPN_LOGIN_URL = "https://www.espn.com/fantasy/football/"
-REQUIRED_COOKIES = ("SWID", "espn_s2")
-POLL_SECONDS = 2.0
+ENV_PATH = Path(__file__).resolve().parent / ".env"
 
-
-def _fail(message: str) -> "NoReturn":  # type: ignore[valid-type]
-    print(f"\n  ERROR  {message}\n", file=sys.stderr)
-    raise SystemExit(1)
+# How long to wait for a manual login before giving up. Without a ceiling a
+# failed login leaves the script spinning forever with no way to tell whether
+# it is working.
+LOGIN_TIMEOUT_SECONDS = 300
+POLL_INTERVAL_SECONDS = 2
 
 
-def capture(headless: bool = False, timeout: int = 300) -> dict[str, str]:
-    """Drive Chrome until both ESPN session cookies are present."""
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        _fail(
-            "Playwright is not installed.\n"
-            "         pip install -r requirements.txt\n"
-            "         python -m playwright install chromium"
-        )
+def write_env(updates: dict, path: Path = ENV_PATH) -> Path:
+    """Merge keys into .env, preserving any this script does not manage.
 
-    PROFILE_DIR.mkdir(exist_ok=True)
-    captured: dict[str, str] = {}
+    Overwriting the file wholesale would discard LEAGUE_ID, SEASON, and TEAM_ID
+    every time credentials are refreshed. Written 0600: the file holds a live
+    session token, and anything looser leaves it readable by other accounts.
+    """
+    existing = {}
+    if path.exists():
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            existing[key.strip()] = value.strip()
 
-    with sync_playwright() as playwright:
-        try:
-            context = playwright.chromium.launch_persistent_context(
-                user_data_dir=str(PROFILE_DIR),
-                channel="chrome",
-                headless=headless,
-                viewport={"width": 1280, "height": 900},
-            )
-        except Exception as exc:
-            _fail(
-                "Could not launch the local Chrome binary via "
-                f'channel="chrome".\n         {exc}\n'
-                "         Install Google Chrome, or swap to bundled Chromium "
-                "by removing the channel argument."
-            )
+    existing.update({k: v for k, v in updates.items() if v not in (None, "")})
 
-        page = context.pages[0] if context.pages else context.new_page()
-        page.goto(ESPN_LOGIN_URL, wait_until="domcontentloaded")
-
-        print("\n  Chrome is open on ESPN Fantasy Football.")
-        print("  Sign in there if you are not already signed in.")
-        print("  This script is watching the cookie jar and will exit on its own.\n")
-
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            jar = {
-                cookie["name"]: cookie["value"]
-                for cookie in context.cookies()
-                if cookie["name"] in REQUIRED_COOKIES
-            }
-            if all(jar.get(name) for name in REQUIRED_COOKIES):
-                captured = jar
-                break
-            time.sleep(POLL_SECONDS)
-
-        context.close()
-
-    if not captured:
-        _fail(
-            f"Timed out after {timeout}s without seeing both cookies.\n"
-            "         Make sure you completed the ESPN login in the window."
-        )
-
-    swid = captured["SWID"]
-    if not swid.startswith("{"):
-        swid = "{" + swid.strip("{}") + "}"
-    captured["SWID"] = swid
-    return captured
+    path.write_text("".join(f"{k}={v}\n" for k, v in existing.items()))
+    path.chmod(0o600)
+    return path
 
 
-def write_env(cookies: dict[str, str]) -> None:
-    """Merge captured cookies into ``.env``, preserving every other key."""
-    lines: list[str] = []
-    if ENV_PATH.exists():
-        lines = ENV_PATH.read_text().splitlines()
-    else:
-        example = PROJECT_ROOT / ".env.example"
-        if example.exists():
-            lines = example.read_text().splitlines()
+def run() -> int:
+    with sync_playwright() as p:
+        browser = p.chromium.launch(channel="chrome", headless=False)
+        context = browser.new_context()
+        page = context.new_page()
 
-    updates = {"SWID": cookies["SWID"], "ESPN_S2": cookies["espn_s2"]}
-    seen: set[str] = set()
-    out: list[str] = []
+        print("\nOpening Chrome. Log in to ESPN in that window.")
+        page.goto("https://www.espn.com/login")
 
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            out.append(line)
-            continue
-        key = stripped.split("=", 1)[0].strip()
-        if key in updates:
-            out.append(f"{key}={updates[key]}")
-            seen.add(key)
-        else:
-            out.append(line)
+        swid, espn_s2 = None, None
+        deadline = time.monotonic() + LOGIN_TIMEOUT_SECONDS
 
-    for key, value in updates.items():
-        if key not in seen:
-            out.append(f"{key}={value}")
+        while not (swid and espn_s2):
+            if time.monotonic() > deadline:
+                browser.close()
+                print(
+                    f"\n[TIMEOUT] No ESPN session found after "
+                    f"{LOGIN_TIMEOUT_SECONDS}s. Nothing was written.",
+                    file=sys.stderr,
+                )
+                return 1
 
-    ENV_PATH.write_text("\n".join(out).rstrip() + "\n")
-    ENV_PATH.chmod(0o600)
+            time.sleep(POLL_INTERVAL_SECONDS)
+            for cookie in context.cookies():
+                if cookie["name"] == "SWID":
+                    swid = cookie["value"]
+                elif cookie["name"] == "espn_s2":
+                    espn_s2 = cookie["value"]
 
+        # LEAGUE_ID / SEASON / TEAM_ID are the user's own and are left alone.
+        path = write_env({"SWID": swid, "ESPN_S2": espn_s2})
+        browser.close()
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--headless", action="store_true",
-                        help="run without a visible window (needs a warm profile)")
-    parser.add_argument("--print-only", action="store_true",
-                        help="print the cookies instead of writing .env")
-    parser.add_argument("--timeout", type=int, default=300,
-                        help="seconds to wait for login (default: 300)")
-    args = parser.parse_args()
-
-    cookies = capture(headless=args.headless, timeout=args.timeout)
-
-    if args.print_only:
-        print(f"SWID={cookies['SWID']}")
-        print(f"ESPN_S2={cookies['espn_s2']}")
-        return 0
-
-    write_env(cookies)
-    masked = cookies["espn_s2"][:8] + "..." + cookies["espn_s2"][-4:]
-    print(f"  Captured SWID    {cookies['SWID']}")
-    print(f"  Captured espn_s2 {masked}  ({len(cookies['espn_s2'])} chars)")
-    print(f"  Written to       {ENV_PATH}  (mode 600, gitignored)")
-    print("\n  Next:  python get_settings.py\n")
+    # The token is never printed in full; a masked tail is enough to confirm
+    # which session was captured without putting the credential on screen.
+    print(f"\n[SUCCESS] Credentials written to {path} (mode 600).")
+    print(f"          SWID {swid[:10]}...  ESPN_S2 ...{espn_s2[-6:]}")
+    if "LEAGUE_ID" not in path.read_text():
+        print("\n  Next: set LEAGUE_ID in .env, or use Sync League in the app.")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run())

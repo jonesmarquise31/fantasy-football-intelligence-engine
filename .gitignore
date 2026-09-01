@@ -17,5 +17,10 @@ venv/
 *.egg-info/
 .pytest_cache/
 
+# PyInstaller build artifacts. Reproducible from Underwriter.spec.
+build/
+dist/
+*.zip
+
 # OS
 .DS_Store
